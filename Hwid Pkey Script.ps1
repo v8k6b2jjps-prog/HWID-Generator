@@ -1,4 +1,4 @@
-using namespace System
+﻿using namespace System
 using namespace System.IO
 using namespace System.Text
 using namespace System.Numerics
@@ -6,6 +6,67 @@ using namespace System.Reflection
 using namespace System.IO.Compression
 using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
+
+<#
+// ============================================================================
+//  MSFT_PKEY_DATA 0x58 bytes. Shared by 2005 and 2009.
+//  Begins at PID_OBJ+0x20; decoder writes it in place via &obj->Data.
+// ============================================================================
+
+typedef struct _MSFT_PKEY_DATA {       // 0x58
+    uint64_t Reserved;                 // 0x00  = 0
+    GUID     Algorithm;                // 0x08  2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
+                                       //       2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+                                       //   constant per algorithm (GetClsidAlgorithm);
+                                       //   NOT key-specific, NOT the ProductId ActConfigId GUID
+    uint32_t GroupID;                  // 0x18
+    uint32_t serialLow;                // 0x1C  channel  = fullSerial / 1_000_000
+    uint32_t SerialHigh;               // 0x20  sequence = fullSerial % 1_000_000
+    uint32_t LicenseFlags;             // 0x24  bit0 = upgrade
+    uint64_t Security;                 // 0x28
+    uint32_t HaveRawKey;               // 0x30  1 once RawKeyMaterial@0x38 is populated (set early, both algos)
+    uint32_t Solved;                   // 0x34  0 until validation succeeds; 1 on success
+                                       //       (2005: 0 through pipeline ג†’ 1 after MITM; 2009: 1 at parse;
+                                       //        stays 0 on an invalid key)
+    uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
+    union {                            // 0x48  16-byte slot
+        uint8_t  DecodedM[12];         //   2005: M value (6 bytes) + 6 zero padding → base64 12
+        uint8_t  ActData[13];          //   2009: 13 packed bytes
+        uint8_t  Payload[16];          //   full slot; unused tail = 0
+    };
+} MSFT_PKEY_DATA;                      // ends 0x58
+
+// ============================================================================
+//  PID_OBJ 0x98 bytes. Embeds MSFT_PKEY_DATA at +0x20.
+// ============================================================================
+
+typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
+    uint64_t       RefCount;           // 0x00  = 1 at build; atomic, freed at 0
+    wchar_t*       ProductIdStr;       // 0x08  "msft2005:{ActConfigId}&{base64}" (sub_180015728)
+    FILETIME       ValidationTime;     // 0x10
+    uint32_t       Serial;             // 0x18  full un-split serial
+    uint32_t       _pad1C;             // 0x1C  alignment to 0x20
+
+    MSFT_PKEY_DATA Data;               // 0x20 .. 0x78
+
+    void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID, GroupID, sub-ptrs}
+                                       //   2005: {flag, ActConfigId GUID (a0cde89c…), GroupID 172, sub-ptrs}
+                                       //   2009: {flag, ActConfigId GUID, GroupID, sub-ptrs}
+
+    void*    pEditionTable;            // 0x80 -> edition records
+                                       //   2005: interned pkeyconfig XML (<pkc:PartNumber>X15-…, IsValid, edition GUIDs)
+                                       //   2009: {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
+
+    void*    pGroupIndex;              // 0x88 -> master index
+                                       //   2005: key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
+                                       //   2009: master index of all GroupIDs
+
+    uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
+                                       //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
+                                       //       NOT a pointer, NOT key-derived — differs every construction.
+
+} PID_OBJ;                             // 0x98
+#>
 
 #region HWID
 # API: LicensingWinRT.dll
@@ -2108,42 +2169,6 @@ function Invoke-IIDRequest {
         [Nullable[Guid]]$SkuID
     )
 
-    <#
-    // Size: 0x58 (88 bytes) // v12
-    typedef struct _MSFT_PKEY_DATA {
-        uint64_t Reserved;          // 0x00
-        uint8_t  Signature[16];     // 0x08
-        uint32_t GroupID;           // 0x18
-        uint32_t ChannelID;         // 0x1C
-        uint32_t Serial;            // 0x20
-        uint32_t Sequence;          // 0x24
-        uint64_t SecurityID;        // 0x28
-        uint32_t LicenseAttributes; // 0x30
-        uint32_t KeyType;           // 0x34
-        uint64_t IssuanceTimestamp; // 0x38
-        uint32_t ActivationFlags;   // 0x40
-        uint32_t ReservedPadding;   // 0x44
-        uint8_t  HardwareID[16];    // 0x48
-    } MSFT_PKEY_DATA;
-
-    // Size: 0x98 (152 bytes) // lpMem
-    typedef struct _PID_OBJ {
-        uint64_t       RefCount;          // 0x00
-        wchar_t*       ProductIdStr;      // 0x08
-        FILETIME       ValidationTime;    // 0x10
-        uint32_t       DataIdSequence;    // 0x18
-        uint32_t       AlignmentPadding;  // 0x1C
-
-        // v12, Function Take V12+8
-        MSFT_PKEY_DATA Data;              // 0x20 - 0x78
-
-        void*          pPKeyConfig;       // 0x78
-        void*          pKeyBits;          // 0x80
-        void*          pMetadata;         // 0x88
-        uint8_t        RandomSeed[8];     // 0x90
-    } PID_OBJ;
-    #>
-
     try {
         $Module = [AppDomain]::CurrentDomain.GetAssemblies() | ? { $_.ManifestModule.ScopeName -eq "OFF" } | select -Last 1
         $Global:OFF = $Module.GetTypes()[0]
@@ -2189,8 +2214,8 @@ function Invoke-IIDRequest {
             <#
             msft:rm/algorithm/pkey/2009
             .text:000000018000A050 CLSID_IProductKeyAlgorithm2009 dd 660672EFh            ; Data1
-            .text:000000018000A050                                         ; DATA XREF: CAlgorithmsFactoryClient::CreateInstance(_GUID const &,_GUID const &,void * *)+79↓r
-            .text:000000018000A050                                         ; CConfigCacheUtil::CreatePkeyAlgorithmObject<CAlgorithmsFactoryClient>(ushort const *,IProductKeyAlgorithm * *,_GUID *)+3E↓r ...
+            .text:000000018000A050                                         ; DATA XREF: CAlgorithmsFactoryClient::CreateInstance(_GUID const &,_GUID const &,void * *)+79ג†“r
+            .text:000000018000A050                                         ; CConfigCacheUtil::CreatePkeyAlgorithmObject<CAlgorithmsFactoryClient>(ushort const *,IProductKeyAlgorithm * *,_GUID *)+3Eג†“r ...
             .text:000000018000A050                 dw 7809h                ; Data2
             .text:000000018000A050                 dw 4CFDh                ; Data3
             .text:000000018000A050                 db 8Dh, 54h, 41h, 0B7h, 0FBh, 73h, 89h, 88h; Data4
